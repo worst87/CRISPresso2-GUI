@@ -1,0 +1,783 @@
+# Import necessary libraries
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import os
+import pandas as pd
+import re # For more flexible filename parsing
+
+# --- Core Logic Functions ---
+
+def extract_base_name(filename):
+    """
+    Extracts a base name from a FASTQ filename.
+    Prioritizes the part before the first underscore.
+    Falls back to removing common suffixes if no underscore is present.
+    """
+    base = os.path.basename(filename)
+    if '_' in base:
+        return base.split('_', 1)[0]
+    else:
+        # Try removing common suffixes more robustly
+        simple_base = re.sub(r'(_R[12]|\.[12])?(_\d+)?(\.f(ast)?q)?(\.gz)?$', '', base, flags=re.IGNORECASE)
+        # If removal didn't change anything substantial, split by first dot as fallback
+        if not simple_base or simple_base == base:
+             simple_base = base.split('.', 1)[0]
+        return simple_base
+
+def pair_fastq_files(file_list):
+    """
+    Pairs R1 and R2 FASTQ files from a list based on common naming conventions.
+    Handles _R1/_R2, .R1/.R2, _1/_2, .1/.2 indicators using regex for accuracy.
+    """
+    pairs = {}
+    unpaired = {}
+    processed_indices = set()
+    file_basenames = [os.path.basename(f) for f in file_list]
+    file_map = {os.path.basename(f): f for f in file_list}
+
+    # More comprehensive patterns, trying to match common separators (. or _)
+    # Order matters slightly - more specific patterns first
+    patterns = [
+        # Patterns with explicit . or _ separators around R1/R2 or 1/2
+        (r'(\.|_)R1(\.|_)', r'\1R2\2'), (r'(\.|_)1(\.|_)', r'\12\2'),
+        # Patterns ending with R1/R2 or 1/2 (optionally followed by extension)
+        (r'(\.|_)R1(?=\.f|\.fq|\.fastq|\.gz|$)', r'\1R2'), (r'(\.|_)1(?=\.f|\.fq|\.fastq|\.gz|$)', r'\12'),
+        # Less common: R1/R2 or 1/2 directly before extension or end of string
+        (r'R1(?=\.f|\.fq|\.fastq|\.gz|$)', 'R2'), (r'1(?=\.f|\.fq|\.fastq|\.gz|$)', '2')
+    ]
+
+    print(f"Attempting to pair {len(file_list)} files...")
+
+    for i, r1_path in enumerate(file_list):
+        if i in processed_indices: continue
+        r1_base = file_basenames[i]
+        found_pair = False
+        for r1_pattern_re_str, r2_replacement_str in patterns:
+            # Use re.sub for replacement logic, checking if a change occurred
+            potential_r2_base = re.sub(r1_pattern_re_str, r2_replacement_str, r1_base, count=1, flags=re.IGNORECASE)
+
+            # Check if substitution actually happened and the potential R2 exists
+            if potential_r2_base != r1_base and potential_r2_base in file_map:
+                r2_path = file_map[potential_r2_base]
+                try: r2_index = file_list.index(r2_path)
+                except ValueError: continue # Should not happen if in file_map, but safety first
+
+                if r2_index not in processed_indices:
+                    base_name = extract_base_name(r1_path)
+                    if base_name not in pairs:
+                        pairs[base_name] = {'r1': r1_path, 'r2': r2_path}
+                        processed_indices.add(i); processed_indices.add(r2_index)
+                        print(f"Paired: '{r1_base}' and '{potential_r2_base}' under base name '{base_name}'")
+                        found_pair = True; break
+                    else:
+                        # Handle potential duplicate base names - mark both as unpaired
+                        reason = f"Duplicate base name '{base_name}'"
+                        unpaired[r1_path] = reason
+                        if r2_index not in processed_indices:
+                             unpaired[r2_path] = reason; processed_indices.add(r2_index)
+                        processed_indices.add(i) # Mark R1 as processed (even if unpaired)
+                        print(f"Warning: {reason} for files '{r1_base}' and '{potential_r2_base}'. Marking as unpaired.")
+                        found_pair = True; break # Stop trying patterns for this R1
+
+        # If after trying all patterns, no pair was found and it wasn't processed as part of a duplicate
+        if not found_pair and i not in processed_indices:
+            # Check if it looks like an R2 file based on the patterns
+            is_likely_r2 = any(re.search(p2_repl.replace(r'\1', '.').replace(r'\2', '.'), r1_base, re.IGNORECASE) for p1_re, p2_repl in patterns if re.search(p1_re, "DUMMYR1", re.IGNORECASE)) # Crude check
+            if not is_likely_r2:
+                 unpaired[r1_path] = "No matching R2 found or pattern mismatch"
+                 print(f"Unpaired R1 candidate: '{r1_base}' - Reason: {unpaired[r1_path]}.")
+            # Mark as processed to avoid re-checking later
+            processed_indices.add(i)
+
+    # Final check for any files completely missed (should be rare now)
+    final_unpaired_r1 = {}; final_unpaired_r2 = {}
+    for idx, fpath in enumerate(file_list):
+         if idx not in processed_indices:
+             fname = os.path.basename(fpath)
+             is_likely_r2 = any(re.search(p2_repl.replace(r'\1', '.').replace(r'\2', '.'), fname, re.IGNORECASE) for p1_re, p2_repl in patterns if re.search(p1_re, "DUMMYR1", re.IGNORECASE))
+             if is_likely_r2:
+                  final_unpaired_r2[fpath] = "No matching R1 found or pattern mismatch"
+                  print(f"Unpaired R2: '{fname}' - Reason: {final_unpaired_r2[fpath]}.")
+             else:
+                  # If already marked in 'unpaired', use that reason, otherwise generic
+                  reason = unpaired.get(fpath, "Did not match R1/R2 patterns or its pair was missing/invalid")
+                  final_unpaired_r1[fpath] = reason
+                  print(f"Unclassified/Unpaired: '{fname}' - Reason: {reason}")
+
+    # Consolidate unpaired lists based on likely R1/R2 status
+    for fpath, reason in unpaired.items():
+         fname = os.path.basename(fpath)
+         is_likely_r1 = any(re.search(p1_re, fname, re.IGNORECASE) for p1_re, p2_repl in patterns)
+         is_likely_r2 = any(re.search(p2_repl.replace(r'\1', '.').replace(r'\2', '.'), fname, re.IGNORECASE) for p1_re, p2_repl in patterns if re.search(p1_re, "DUMMYR1", re.IGNORECASE))
+
+         if is_likely_r1 and not is_likely_r2 and fpath not in final_unpaired_r2:
+             final_unpaired_r1[fpath] = reason
+         elif is_likely_r2 and fpath not in final_unpaired_r1:
+             final_unpaired_r2[fpath] = reason
+         elif fpath not in final_unpaired_r1 and fpath not in final_unpaired_r2: # If uncertain, default to R1 list
+             final_unpaired_r1[fpath] = reason
+
+    return list(pairs.values()), final_unpaired_r1, final_unpaired_r2
+
+
+def load_excel_data(filepath):
+    """Loads Name/Sequence data from an Excel file, ensuring strings and stripping whitespace."""
+    if not filepath or not os.path.exists(filepath):
+        return None, None, "File not selected or does not exist."
+    try:
+        # Read first two columns explicitly as string, ignore others
+        df = pd.read_excel(filepath, header=0, usecols=[0, 1], dtype=str)
+        if df.shape[1] < 2:
+            return None, None, f"Excel file '{os.path.basename(filepath)}' has fewer than 2 columns."
+        # Ensure columns are treated as strings, fill NA with empty string, then strip
+        original_names = df.iloc[:, 0].fillna('').astype(str).str.strip().tolist()
+        sequences = df.iloc[:, 1].fillna('').astype(str).str.strip()
+        # Create lookup keys (uppercase names)
+        lookup_keys = df.iloc[:, 0].fillna('').astype(str).str.strip().str.upper()
+        # Create dictionary, handling potential duplicate keys (last one wins)
+        lookup_dict = pd.Series(sequences.values, index=lookup_keys).to_dict()
+        # Filter out empty names/keys from the list shown in dropdown
+        valid_original_names = [name for name in original_names if name.strip() and name.strip().upper() in lookup_dict]
+        # Filter lookup_dict to remove entries where the key was originally empty
+        lookup_dict = {k: v for k, v in lookup_dict.items() if k}
+
+        if not lookup_dict:
+             return None, None, f"No valid Name/Sequence pairs found in '{os.path.basename(filepath)}'."
+
+        return lookup_dict, valid_original_names, None
+    except Exception as e:
+        return None, None, f"Error reading Excel file '{os.path.basename(filepath)}': {e}"
+
+def get_sequence_from_name(selected_name, lookup_dict, file_type_for_error):
+    """
+    Gets sequence specifically by looking up a name from the dropdown list.
+    Returns (sequence, error_message). sequence is "" if error or not found.
+    """
+    if not selected_name: return "", f"No {file_type_for_error} name selected from dropdown."
+    if lookup_dict is None: return "", f"Cannot lookup {file_type_for_error} name '{selected_name}'. No lookup file loaded."
+    lookup_key = selected_name.strip().upper()
+    seq = lookup_dict.get(lookup_key)
+    if seq is not None:
+        # Ensure sequence is uppercase and valid characters before returning
+        seq_upper = str(seq).upper().strip()
+        if re.fullmatch(r'[ATCGN]*', seq_upper): # Allow empty string if that's what's in excel
+             return seq_upper, None
+        else:
+             return "", f"{file_type_for_error} name '{selected_name}' has invalid characters in sequence: '{seq}'"
+    else:
+        # This case should be rare if names_list is derived correctly
+        return "", f"{file_type_for_error} name '{selected_name}' (key: '{lookup_key}') unexpectedly not found in loaded lookup data."
+
+def is_valid_sequence(seq_str):
+    """Checks if a string looks like a valid DNA sequence (ATCGN, >15 chars)."""
+    if not isinstance(seq_str, str): return False
+    stripped_val = seq_str.strip().upper() # Check uppercase
+    if not stripped_val: return False
+    # Allow only ATCGN characters
+    is_only_atcgn = re.fullmatch(r'[ATCGN]+', stripped_val)
+    # Heuristic length check - adjust if necessary (e.g., for short guides)
+    is_long_enough = len(stripped_val) >= 15 # Lowered threshold slightly
+    return bool(is_only_atcgn) and is_long_enough
+
+def reverse_complement(seq):
+    """Returns the reverse complement of a DNA sequence."""
+    if not isinstance(seq, str): return ""
+    seq = seq.upper()
+    complement_map = str.maketrans("ATCGN", "TAGCN")
+    return seq.translate(complement_map)[::-1]
+
+def find_guide_in_amplicon(amplicon, guide):
+    """
+    Finds guide sequence within amplicon (case-insensitive).
+    Checks forward strand first, then reverse complement.
+    Returns start index (0-based) if found, otherwise None.
+    Handles potential N's in sequences.
+    """
+    if not amplicon or not guide: return None
+    amplicon_upper = amplicon.upper(); guide_upper = guide.upper()
+
+    # Try finding the guide directly
+    start_index = amplicon_upper.find(guide_upper)
+    if start_index != -1: return start_index
+
+    # Try finding the reverse complement
+    guide_revcomp = reverse_complement(guide_upper)
+    if not guide_revcomp: return None # Handle case where guide is invalid
+    start_index = amplicon_upper.find(guide_revcomp)
+    if start_index != -1: return start_index
+
+    return None # Not found in either orientation
+
+
+# --- GUI Application Class ---
+
+class CrispressoBatchApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("CRISPresso2 Batch File Creator")
+        initial_width = 1000
+        initial_height = 750 # Reduced height slightly as one button removed
+        self.geometry(f"{initial_width}x{initial_height}")
+        self.minsize(initial_width, initial_height - 50)
+
+        self.fastq_files = []
+        self.paired_files_data = []
+        self.amplicon_lookup = None
+        self.guide_lookup = None
+        self.amplicon_names_list = []
+        self.guide_names_list = []
+        self.amplicon_excel_path = tk.StringVar()
+        self.guide_excel_path = tk.StringVar()
+        self._last_clicked_item = None
+        self.last_saved_filepath = ""
+
+        self._create_widgets()
+
+    def _create_widgets(self):
+        main_frame = ttk.Frame(self, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        main_frame.rowconfigure(3, weight=1) # Table row expands
+        main_frame.columnconfigure(0, weight=1) # Main column expands
+
+        # --- Input Controls --- (Row 0)
+        input_frame = ttk.LabelFrame(main_frame, text="Inputs", padding="10")
+        input_frame.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 5))
+        input_frame.columnconfigure(1, weight=1) # Make label column expandable
+        ttk.Button(input_frame, text="Select FASTQ Files (R1/R2)", command=self._select_fastq).grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.fastq_list_label = ttk.Label(input_frame, text="0 files selected", wraplength=700, justify=tk.LEFT)
+        self.fastq_list_label.grid(row=0, column=1, columnspan=3, padx=5, pady=5, sticky="ew")
+        ttk.Button(input_frame, text="Select Amplicon Excel (Optional)", command=lambda: self._select_excel("amplicon")).grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        ttk.Label(input_frame, textvariable=self.amplicon_excel_path).grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+        self.amplicon_status_label = ttk.Label(input_frame, text="", foreground="blue")
+        self.amplicon_status_label.grid(row=1, column=2, padx=5, pady=5, sticky="w")
+        ttk.Button(input_frame, text="Select Guide RNA Excel (Optional)", command=lambda: self._select_excel("guide")).grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        ttk.Label(input_frame, textvariable=self.guide_excel_path).grid(row=2, column=1, padx=5, pady=5, sticky="ew")
+        self.guide_status_label = ttk.Label(input_frame, text="", foreground="blue")
+        self.guide_status_label.grid(row=2, column=2, padx=5, pady=5, sticky="w")
+        ttk.Button(input_frame, text="Process FASTQ Files & Populate Table", command=self._process_and_populate).grid(row=3, column=0, columnspan=3, padx=5, pady=10)
+
+
+        # --- Settings Application --- (Row 1)
+        settings_frame = ttk.LabelFrame(main_frame, text="Apply Settings / Clear Selected", padding="10")
+        settings_frame.grid(row=1, column=0, sticky="ew", padx=0, pady=5)
+        settings_frame.columnconfigure(1, weight=1) # Make combobox/entry column expand
+        settings_frame.columnconfigure(3, weight=0) # Keep clear buttons fixed size
+        ttk.Label(settings_frame, text="Amplicon (Select or Type Seq):").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.amplicon_combobox = ttk.Combobox(settings_frame, width=38, state="disabled", values=self.amplicon_names_list) # Start disabled
+        self.amplicon_combobox.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        ttk.Button(settings_frame, text="Apply Amplicon", command=lambda: self._apply_setting('amplicon_seq')).grid(row=0, column=2, padx=5, pady=5)
+        ttk.Button(settings_frame, text="Clear Selected Amplicons", command=self._clear_amplicon_column).grid(row=0, column=3, padx=15, pady=5)
+        ttk.Label(settings_frame, text="Guide RNA (Select or Type Seq):").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.guide_combobox = ttk.Combobox(settings_frame, width=38, state="disabled", values=self.guide_names_list) # Start disabled
+        self.guide_combobox.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+        ttk.Button(settings_frame, text="Apply Guide", command=lambda: self._apply_setting('guide_seq')).grid(row=1, column=2, padx=5, pady=5)
+        ttk.Button(settings_frame, text="Clear Selected Guides", command=self._clear_guide_column).grid(row=1, column=3, padx=15, pady=5)
+        ttk.Label(settings_frame, text="Min Alignment Score:").grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        self.score_entry = ttk.Entry(settings_frame, width=10); self.score_entry.insert(0, "60")
+        self.score_entry.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+        ttk.Button(settings_frame, text="Apply Score", command=lambda: self._apply_setting('default_min_aln_score')).grid(row=2, column=2, padx=5, pady=5)
+        ttk.Label(settings_frame, text="Plot Window Size:").grid(row=3, column=0, padx=5, pady=5, sticky="w")
+        self.window_entry = ttk.Entry(settings_frame, width=10); self.window_entry.insert(0, "30")
+        self.window_entry.grid(row=3, column=1, padx=5, pady=5, sticky="w")
+        ttk.Button(settings_frame, text="Apply Window Size", command=lambda: self._apply_setting('plot_window_size')).grid(row=3, column=2, padx=5, pady=5)
+        # Removed the Maximize Window button
+
+
+        # --- Action Buttons --- (Row 2)
+        action_frame = ttk.Frame(main_frame, padding=(10, 5, 10, 5))
+        action_frame.grid(row=2, column=0, sticky="ew", padx=0, pady=(5, 0))
+        action_frame.columnconfigure(1, weight=1) # Push save button right
+        ttk.Button(action_frame, text="Delete Selected Rows", command=self._delete_selected_rows).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="Copy CRISPresso2 Command", command=self._copy_crispresso_command).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="Create Tab Delimited File", command=self._save_tsv).pack(side=tk.RIGHT, padx=5)
+
+
+        # --- Table Preview --- (Row 3)
+        table_frame = ttk.LabelFrame(main_frame, text="Preview (Click Row to Select/Deselect)", padding="10")
+        table_frame.grid(row=3, column=0, sticky="nsew", padx=0, pady=5)
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+        columns = ("name", "fastq_r1", "fastq_r2", "amplicon_seq", "guide_seq", "default_min_aln_score", "plot_window_size")
+        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="extended")
+        # Adjust column widths if needed
+        self.tree.heading("name", text="Name (name)"); self.tree.column("name", width=120, stretch=tk.NO)
+        self.tree.heading("fastq_r1", text="FASTQ R1 (fastq_r1)"); self.tree.column("fastq_r1", width=250)
+        self.tree.heading("fastq_r2", text="FASTQ R2 (fastq_r2)"); self.tree.column("fastq_r2", width=250)
+        self.tree.heading("amplicon_seq", text="Amplicon Seq (amplicon_seq)"); self.tree.column("amplicon_seq", width=200)
+        self.tree.heading("guide_seq", text="Guide Seq (guide_seq)"); self.tree.column("guide_seq", width=150)
+        self.tree.heading("default_min_aln_score", text="Min Score"); self.tree.column("default_min_aln_score", width=70, stretch=tk.NO, anchor=tk.CENTER)
+        self.tree.heading("plot_window_size", text="Window Size"); self.tree.column("plot_window_size", width=80, stretch=tk.NO, anchor=tk.CENTER)
+        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb.grid(row=1, column=0, sticky='ew')
+        self.tree.bind("<ButtonPress-1>", self._on_tree_click)
+
+
+    # --- Event Handlers and Actions ---
+
+    def _on_tree_click(self, event):
+        """Handles left-click press to toggle selection of the clicked row."""
+        region = self.tree.identify_region(event.x, event.y)
+        if region != "cell":
+            # Click outside cells, potentially clear selection if desired, but default is no-op
+            # self.tree.selection_set(()) # Uncomment to clear selection on outside click
+            self._last_clicked_item = None
+            return
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            self._last_clicked_item = None
+            return
+
+        current_selection = self.tree.selection()
+        # If the clicked item was the *only* selected item, deselect it
+        if item_id == self._last_clicked_item and item_id in current_selection and len(current_selection) == 1:
+             # Use 'after' to delay the deselection slightly, allowing the default selection mechanism to finish
+             self.after(5, lambda: self.tree.selection_remove(item_id))
+             self._last_clicked_item = None # Reset last clicked since it's now deselected
+        else:
+             # Otherwise, let the default (multi-)selection behavior happen
+             # Store the potentially newly selected item as the last clicked
+             self._last_clicked_item = item_id
+
+    def _select_fastq(self):
+        filetypes = (('FASTQ files', '*.fastq *.fq *.fastq.gz *.fq.gz'), ('All files', '*.*'))
+        # Use parent=self for modal behavior relative to the main window
+        filenames = filedialog.askopenfilenames(parent=self, title='Select R1 and R2 FASTQ files', filetypes=filetypes)
+        if filenames:
+            self.fastq_files = list(filenames)
+            display_names = [os.path.basename(f) for f in self.fastq_files]
+            # Limit displayed names if too many selected
+            max_display = 5
+            if len(display_names) > max_display:
+                display_text = f"{len(self.fastq_files)} files selected: {', '.join(display_names[:max_display])}, ..."
+            else:
+                display_text = f"{len(self.fastq_files)} files selected: {', '.join(display_names)}"
+            self.fastq_list_label.config(text=display_text)
+        else:
+            # Only update if the list is truly empty (user cancelled)
+            if not self.fastq_files:
+                 self.fastq_list_label.config(text="0 files selected")
+
+    def _select_excel(self, file_type):
+        """Handles Excel file selection and updates the corresponding Combobox."""
+        filepath = filedialog.askopenfilename(parent=self, title=f'Select {file_type.capitalize()} Excel Lookup File', filetypes=(('Excel files', '*.xlsx *.xls'), ('All files', '*.*')))
+        if filepath:
+            lookup_dict, names_list, err = load_excel_data(filepath)
+            status_label, path_var, combobox, names_attr, lookup_attr = (None, None, None, None, None)
+
+            if file_type == "amplicon":
+                status_label = self.amplicon_status_label; path_var = self.amplicon_excel_path
+                combobox = self.amplicon_combobox; names_attr = "amplicon_names_list"; lookup_attr = "amplicon_lookup"
+            elif file_type == "guide":
+                status_label = self.guide_status_label; path_var = self.guide_excel_path
+                combobox = self.guide_combobox; names_attr = "guide_names_list"; lookup_attr = "guide_lookup"
+
+            if path_var: path_var.set(os.path.basename(filepath))
+
+            if status_label and combobox:
+                if err:
+                    messagebox.showerror("Excel Error", err, parent=self)
+                    status_label.config(text="Error loading", foreground="red")
+                    setattr(self, lookup_attr, None); setattr(self, names_attr, [])
+                    combobox['values'] = []; combobox.set(''); combobox.config(state="disabled")
+                elif lookup_dict is not None and names_list is not None:
+                    status_label.config(text=f"{len(lookup_dict)} entries loaded", foreground="green")
+                    setattr(self, lookup_attr, lookup_dict); setattr(self, names_attr, names_list)
+                    combobox['values'] = names_list
+                    combobox.config(state="normal") # Enable typing/selection
+                    combobox.set('') # Start blank
+                else:
+                    # This case might happen if load_excel_data returns None, None, None
+                    status_label.config(text="Load failed", foreground="red")
+                    setattr(self, lookup_attr, None); setattr(self, names_attr, [])
+                    combobox['values'] = []; combobox.set(''); combobox.config(state="disabled")
+
+    def _process_and_populate(self):
+        """Populates table with FASTQ pairs; Amplicon/Guide initially blank."""
+        if not self.fastq_files:
+            messagebox.showwarning("No FASTQ Files", "Please select FASTQ files first.", parent=self)
+            return
+
+        # Clear existing table and internal data
+        for item in self.tree.get_children(): self.tree.delete(item)
+        self.paired_files_data = []
+
+        paired, unpaired_r1, unpaired_r2 = pair_fastq_files(self.fastq_files)
+
+        # --- Report Pairing Issues ---
+        unpaired_messages = []
+        if unpaired_r1:
+            msg = "Unpaired R1 / Other files:\n" + "\n".join([f"- {os.path.basename(f)} ({reason})" for f, reason in unpaired_r1.items()])
+            unpaired_messages.append(msg)
+        if unpaired_r2:
+            msg = "\nUnpaired R2 files:\n" + "\n".join([f"- {os.path.basename(f)} ({reason})" for f, reason in unpaired_r2.items()])
+            unpaired_messages.append(msg)
+
+        if unpaired_messages:
+            # Show a scrollable message box if the message is long
+            full_message = "\n".join(unpaired_messages)
+            if len(full_message) > 500: # Arbitrary length threshold
+                 # Simple text widget in a Toplevel window for scrollable message
+                 top = tk.Toplevel(self)
+                 top.title("Pairing Issues Found")
+                 txt = tk.Text(top, wrap="word", height=15, width=80)
+                 txt.pack(padx=10, pady=10, fill="both", expand=True)
+                 txt.insert("1.0", full_message)
+                 txt.config(state="disabled") # Make read-only
+                 ttk.Button(top, text="OK", command=top.destroy).pack(pady=5)
+                 top.grab_set() # Make modal
+                 self.wait_window(top)
+            else:
+                 messagebox.showwarning("Pairing Issues Found", full_message, parent=self)
+        # --- End Report ---
+
+        if not paired:
+            messagebox.showinfo("No Pairs", "No valid R1/R2 pairs were successfully formed.", parent=self)
+            return
+
+        default_score = self.score_entry.get().strip() or "60"
+        default_window = self.window_entry.get().strip() or "30"
+        initial_amplicon_seq = "" # Start blank
+        initial_guide_seq = ""    # Start blank
+
+        for pair_info in paired:
+             base_name = extract_base_name(pair_info['r1'])
+             r1_name = os.path.basename(pair_info['r1'])
+             r2_name = os.path.basename(pair_info['r2'])
+
+             # Data to display in the treeview
+             row_data_display = (base_name, r1_name, r2_name, initial_amplicon_seq, initial_guide_seq, default_score, default_window)
+             item_id = self.tree.insert("", tk.END, values=row_data_display)
+
+             # More detailed internal data, including full paths
+             internal_data = {
+                 'tree_id': item_id,
+                 'name': base_name,
+                 'fastq_r1_full': pair_info['r1'],
+                 'fastq_r2_full': pair_info['r2'],
+                 'fastq_r1_display': r1_name, # Store display name too
+                 'fastq_r2_display': r2_name, # Store display name too
+                 'amplicon_seq': initial_amplicon_seq,
+                 'guide_seq': initial_guide_seq,
+                 'default_min_aln_score': default_score,
+                 'plot_window_size': default_window
+             }
+             self.paired_files_data.append(internal_data)
+        print(f"Populated table with {len(paired)} pairs.")
+
+    def _apply_setting(self, column_key):
+        """Applies a setting from an entry/combobox field to selected rows (or all if none selected)."""
+        selected_items = self.tree.selection()
+        target_items = selected_items if selected_items else self.tree.get_children()
+        if not target_items:
+            messagebox.showinfo("Info", "Table is empty. Cannot apply settings.", parent=self)
+            return
+
+        value_to_apply_str = ""
+        error_messages = []
+        col_index = -1
+        column_map = {"amplicon_seq": 3, "guide_seq": 4, "default_min_aln_score": 5, "plot_window_size": 6}
+        if column_key not in column_map: return # Should not happen
+        col_index = column_map[column_key]
+
+        err = None; input_val = ""
+        is_sequence_col = column_key in ['amplicon_seq', 'guide_seq']
+        min_len_required = 16 if column_key == 'amplicon_seq' else 16 # Min length for valid seq check
+
+        if column_key == 'amplicon_seq':
+            input_val = self.amplicon_combobox.get().strip()
+            if not input_val: value_to_apply_str = ""; err = None # Clearing the value is allowed
+            else:
+                # Check if it's a name from the loaded list first
+                is_known_name = self.amplicon_lookup and input_val in self.amplicon_names_list
+                if is_known_name:
+                    value_to_apply_str, err = get_sequence_from_name(input_val, self.amplicon_lookup, "Amplicon")
+                # If not a known name, check if it looks like a valid sequence
+                elif re.fullmatch(r'[ATCGN]+', input_val, re.IGNORECASE) and len(input_val) >= min_len_required:
+                    value_to_apply_str = input_val.upper(); err = None
+                else:
+                    err = f"Input '{input_val[:30]}{'...' if len(input_val)>30 else ''}' is not a known Amplicon name and not a valid sequence (ATCGN only, >={min_len_required} chars)."
+                    value_to_apply_str = "" # Don't apply invalid input
+        elif column_key == 'guide_seq':
+            input_val = self.guide_combobox.get().strip()
+            if not input_val: value_to_apply_str = ""; err = None
+            else:
+                is_known_name = self.guide_lookup and input_val in self.guide_names_list
+                if is_known_name:
+                    value_to_apply_str, err = get_sequence_from_name(input_val, self.guide_lookup, "Guide")
+                elif re.fullmatch(r'[ATCGN]+', input_val, re.IGNORECASE) and len(input_val) >= min_len_required:
+                     value_to_apply_str = input_val.upper(); err = None
+                else:
+                     err = f"Input '{input_val[:30]}{'...' if len(input_val)>30 else ''}' is not a known Guide name and not a valid sequence (ATCGN only, >={min_len_required} chars)."
+                     value_to_apply_str = ""
+        elif column_key == 'default_min_aln_score':
+            input_val = self.score_entry.get().strip()
+            if input_val.isdigit() and 0 <= int(input_val) <= 100:
+                 value_to_apply_str = input_val; err = None
+            else: err = "Min Score must be a whole number between 0 and 100."; value_to_apply_str = ""
+        elif column_key == 'plot_window_size':
+            input_val = self.window_entry.get().strip()
+            if input_val.isdigit() and int(input_val) >= 0:
+                 value_to_apply_str = input_val; err = None
+            else: err = "Window Size must be a non-negative whole number."; value_to_apply_str = ""
+
+        if err: # If there was an error validating the input
+            messagebox.showerror("Input Error", err, parent=self)
+            return # Stop before applying
+
+        # Proceed to apply the validated value
+        updated_count = 0
+        for item_id in target_items:
+            try:
+                # Update the treeview display
+                current_values = list(self.tree.item(item_id, 'values'))
+                current_values[col_index] = value_to_apply_str
+                self.tree.item(item_id, values=tuple(current_values))
+
+                # Update the internal data store
+                for item_data in self.paired_files_data:
+                     if item_data.get('tree_id') == item_id:
+                         item_data[column_key] = value_to_apply_str
+                         break # Found and updated, move to next item_id
+                updated_count += 1
+            except tk.TclError as e:
+                print(f"Warning: Could not update item {item_id} in Treeview: {e}")
+                continue # Skip this item if Treeview update fails
+
+        target_desc = f"{len(selected_items)} selected row(s)" if selected_items else "all rows"
+        applied_value_desc = f"'{value_to_apply_str}'" if value_to_apply_str else "'blank'"
+        print(f"Applied {applied_value_desc} to {column_key} for {updated_count} / {len(target_items)} {target_desc}.")
+        if updated_count != len(target_items):
+             print("Note: Some rows might not have been updated if internal data mapping failed.")
+
+
+    def _clear_column(self, column_key, column_name_display):
+        """Internal helper to clear a specific column for SELECTED rows."""
+        target_items = self.tree.selection()
+        if not target_items:
+            messagebox.showinfo("Info", f"No rows selected to clear '{column_name_display}'.", parent=self)
+            return
+
+        if not messagebox.askyesno("Confirm Clear", f"Clear '{column_name_display}' for the {len(target_items)} selected row(s)?", parent=self):
+            return
+
+        column_map = {"amplicon_seq": 3, "guide_seq": 4}
+        if column_key not in column_map: return # Should not happen
+        col_index = column_map[column_key]
+        value_to_apply_str = "" # Value to set (empty string)
+
+        cleared_count = 0
+        for item_id in target_items:
+            try:
+                current_values = list(self.tree.item(item_id, 'values'))
+                if current_values[col_index] != "": # Only update if not already blank
+                    current_values[col_index] = value_to_apply_str
+                    self.tree.item(item_id, values=tuple(current_values))
+                    # Update internal data
+                    for item_data in self.paired_files_data:
+                         if item_data.get('tree_id') == item_id:
+                             item_data[column_key] = value_to_apply_str
+                             break
+                    cleared_count += 1
+            except tk.TclError as e:
+                print(f"Warning: Could not clear item {item_id} in Treeview: {e}")
+                continue
+        print(f"Cleared {cleared_count} entries in '{column_name_display}' for selected rows.")
+
+    def _clear_amplicon_column(self):
+        """Command for the 'Clear Selected Amplicons' button."""
+        self._clear_column('amplicon_seq', 'Amplicon Seq')
+
+    def _clear_guide_column(self):
+        """Command for the 'Clear Selected Guides' button."""
+        self._clear_column('guide_seq', 'Guide Seq')
+
+    # Removed the _maximize_window_size_for_selected method
+
+    def _delete_selected_rows(self):
+        selected_items = self.tree.selection()
+        if not selected_items:
+            messagebox.showinfo("Info", "No rows selected.", parent=self)
+            return
+        if messagebox.askyesno("Confirm Delete", f"Delete {len(selected_items)} selected row(s)?", parent=self):
+            items_to_delete_set = set(selected_items)
+            # Filter internal data first
+            self.paired_files_data = [d for d in self.paired_files_data if d.get('tree_id') not in items_to_delete_set]
+            # Then delete from treeview
+            for item_id in selected_items:
+                try:
+                    if self.tree.exists(item_id):
+                        self.tree.delete(item_id)
+                except tk.TclError as e:
+                    # This might happen if the item was already deleted or is invalid
+                    print(f"Warning: Error deleting item {item_id} from Treeview: {e}")
+                    continue
+            print(f"Deleted {len(selected_items)} rows. Internal data count: {len(self.paired_files_data)}.")
+            self._last_clicked_item = None # Reset last clicked item after deletion
+
+    def _save_tsv(self):
+        """
+        Saves the current table data to a tab-delimited file.
+        Automatically pads amplicon sequences with 'N' based on plot_window_size.
+        Stores the filepath.
+        """
+        if not self.tree.get_children():
+            messagebox.showwarning("Empty Table", "No data to save.", parent=self)
+            return
+
+        # --- Add informational pop-up ---
+        messagebox.showinfo(
+            "Save Location Advice",
+            "Please save this batch file in the same folder as your FASTQ files, or ensure FASTQ paths are correct relative to where you run CRISPresso.",
+            parent=self
+        )
+        # --- End pop-up ---
+
+        filepath = filedialog.asksaveasfilename(
+            parent=self,
+            title="Save CRISPresso2 Batch File As",
+            defaultextension=".txt",
+            initialfile="batch.txt",
+            filetypes=(("Text File", "*.txt"), ("Tab Separated Values", "*.tsv"), ("All files", "*.*"))
+        )
+
+        if not filepath:
+            print("Save cancelled.")
+            return # User cancelled
+
+        padded_count = 0
+        skipped_padding_count = 0
+        padding_warnings = []
+
+        try:
+            with open(filepath, 'w', newline='') as f:
+                # Use lowercase headers matching CRISPressoBatch expectations
+                header = ["name", "fastq_r1", "fastq_r2", "amplicon_seq", "guide_seq", "default_min_aln_score", "plot_window_size"]
+                f.write("\t".join(header) + "\n")
+
+                for item_id in self.tree.get_children():
+                    row_values = list(self.tree.item(item_id, 'values')) # Get as list for modification
+                    row_name = row_values[0] # For warning messages
+
+                    # --- Padding Logic ---
+                    amplicon_seq = str(row_values[3])
+                    guide_seq = str(row_values[4])
+                    window_size_str = str(row_values[6])
+                    padded_amplicon = amplicon_seq # Default to original
+                    needs_padding = False
+
+                    if amplicon_seq and guide_seq and window_size_str.isdigit():
+                        plot_window_size = int(window_size_str)
+                        if plot_window_size > 0: # Only pad if window size > 0
+                            start_index = find_guide_in_amplicon(amplicon_seq, guide_seq)
+
+                            if start_index is not None:
+                                guide_len = len(guide_seq)
+                                amplicon_len = len(amplicon_seq)
+
+                                # Calculate distance from guide ends to amplicon ends
+                                # Note: Using guide ends as proxy for cut site vicinity
+                                left_distance = start_index
+                                right_distance = amplicon_len - (start_index + guide_len)
+
+                                left_padding_needed = max(0, plot_window_size - left_distance)
+                                right_padding_needed = max(0, plot_window_size - right_distance)
+
+                                if left_padding_needed > 0 or right_padding_needed > 0:
+                                    padded_amplicon = ('N' * left_padding_needed) + amplicon_seq + ('N' * right_padding_needed)
+                                    row_values[3] = padded_amplicon # Update the value in the list
+                                    padded_count += 1
+                                    needs_padding = True
+                                    print(f"Row '{row_name}': Padded amplicon (L:{left_padding_needed}, R:{right_padding_needed}). New length: {len(padded_amplicon)}")
+
+                            else:
+                                # Guide not found in amplicon
+                                skipped_padding_count += 1
+                                warn_msg = f"Row '{row_name}': Skipped padding (Guide not found in Amplicon)."
+                                padding_warnings.append(warn_msg); print(warn_msg)
+                        # else: plot_window_size is 0, no padding needed.
+                    elif plot_window_size > 0: # Only warn if padding might have been expected
+                        # Missing amplicon, guide, or invalid window size
+                        skipped_padding_count += 1
+                        reason = ""
+                        if not amplicon_seq: reason = "Missing Amplicon"
+                        elif not guide_seq: reason = "Missing Guide"
+                        elif not window_size_str.isdigit(): reason = "Invalid Window Size"
+                        warn_msg = f"Row '{row_name}': Skipped padding ({reason})."
+                        padding_warnings.append(warn_msg); print(warn_msg)
+                    # --- End Padding Logic ---
+
+                    # Write the (potentially modified) row values
+                    f.write("\t".join(map(str, row_values)) + "\n")
+
+            self.last_saved_filepath = filepath
+            success_message = f"Batch file saved successfully to:\n{filepath}"
+            if padded_count > 0: success_message += f"\n\nApplied padding to {padded_count} amplicon sequence(s)."
+            if skipped_padding_count > 0: success_message += f"\nSkipped padding for {skipped_padding_count} row(s) (see console for details)."
+            messagebox.showinfo("Success", success_message, parent=self)
+            print(f"Batch file saved to {filepath}")
+            if padding_warnings:
+                 print("--- Padding Warnings Summary ---")
+                 for w in padding_warnings: print(w)
+                 print("--- End Padding Warnings ---")
+
+        except Exception as e:
+            self.last_saved_filepath = "" # Invalidate path on error
+            messagebox.showerror("Save Error", f"Error saving file:\n{e}", parent=self)
+            print(f"Error saving file: {e}")
+
+    def _copy_crispresso_command(self):
+        """Generates and copies the CRISPresso2 Docker command to the clipboard."""
+        if not self.last_saved_filepath:
+            messagebox.showwarning("Command Copy Error", "Please save the batch file first using 'Create Tab Delimited File'.", parent=self)
+            return
+        if not os.path.exists(self.last_saved_filepath):
+             messagebox.showwarning("Command Copy Error", f"The previously saved batch file cannot be found:\n{self.last_saved_filepath}\nPlease save it again.", parent=self)
+             self.last_saved_filepath = "" # Invalidate path
+             return
+
+        try:
+            directory = os.path.dirname(self.last_saved_filepath)
+            filename = os.path.basename(self.last_saved_filepath)
+
+            # Convert Windows paths (if applicable) to POSIX-style for Docker volume mount
+            directory_docker = directory.replace("\\", "/")
+            # Ensure the path is absolute for clarity, though relative might work depending on context
+            if not os.path.isabs(directory_docker):
+                 directory_docker = os.path.abspath(directory_docker).replace("\\", "/")
+
+            # Basic command structure
+            command = f'docker run --rm -v "{directory_docker}":/DATA -w /DATA -i pinellolab/crispresso2 CRISPRessoBatch --batch_settings "{filename}" --output_folder output --skip_failed'
+
+            # Attempt to copy to clipboard
+            self.clipboard_clear()
+            self.clipboard_append(command)
+            self.update() # Process clipboard events
+
+            messagebox.showinfo("Command Copied", f"Command copied to clipboard:\n\n{command}", parent=self)
+            print(f"Copied command to clipboard: {command}")
+
+        except Exception as e:
+            messagebox.showerror("Command Copy Error", f"Error generating/copying command:\n{e}", parent=self)
+            print(f"Error generating/copying command: {e}")
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    try:
+        app = CrispressoBatchApp()
+        app.mainloop()
+    except Exception as e:
+        print(f"Fatal Error initializing or running GUI: {e}")
+        import traceback
+        traceback.print_exc()
+        # Fallback error message box if Tkinter is still somewhat functional
+        try:
+            root = tk.Tk()
+            root.withdraw() # Hide the root window
+            messagebox.showerror("Application Error", f"Could not start or run the application.\nError: {e}\n\nCheck the console output for details.")
+            root.destroy()
+        except tk.TclError:
+            pass # If Tkinter itself failed badly
